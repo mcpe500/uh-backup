@@ -1530,7 +1530,7 @@ validation and copies the v2 kernel added around Delta.
 - **Slice 6a build reviews (2026-10-27, under the owner's delegation to the reviewers' majority):** two rounds of four
   build reviews (`/tmp/s6a-build-review{,2}-{astra,fable,opus,sol}.md`), merged into two fix lists
   (`/tmp/s6a-fix{1,2}-brief.md`, 28 and 16 items) by majority, a point raised by one reviewer taking that reviewer's
-  recommendation. Rules they settle beyond fixes of the spec: (1) **members across attempts:** a local object's state
+  recommendation. Rules they settle beyond fixes of the spec: (1) **members across attempts** (**superseded in part** by "References are the only indirection": the reference, not a member source on the object, follows the object across instances): a local object's state
   member is followed by its references and by other objects' derives through one member source per object and member
   name; when a new attempt goes live every member re-binds by name (one diff frame from the last value, consumers'
   derives recompute, a member the new variant lacks fails `invalid/member`), as a remote reference re-holds and gets a
@@ -1637,7 +1637,8 @@ validation and copies the v2 kernel added around Delta.
   purpose of this slice"):** `StoreStorage` declares conversations, entries, tasks, submissions and `record_ids` as
   `defineTable`s, writes them with `put` (Durable replaces complete records), and reads them with the store's queries;
   the outbox, export, import, the applier and later `evolveTable` versions handle them as every table. The partial
-  head index becomes an index on `(conversation_id, has_head, id)`; indexed strings that must stay lossless keep
+  head index becomes a table `entry_heads` (one row per entry with a head; build, 2026-10-27, faster than an index on
+  `(conversation_id, has_head, id)`); indexed strings that must stay lossless keep
   Durable's JSON encoding.
 - **Slice 6b D3: one id counter per store (owner, 2026-10-27: "a"):** the store's counter (`next_document_id`, renamed
   `next_id`; the archive manifest's `nextDocumentId` becomes `nextId`) numbers every id in the store: Durable's
@@ -1659,6 +1660,300 @@ validation and copies the v2 kernel added around Delta.
   step refused fails live (`object_failed`, `broken`: memory and disk disagree); an `int` `CHECK` failure (a plugin's
   value out of range) fails only that transaction (`invalid/args`). `StoreStorage` runs Durable's commit checks in the
   step, where `SqliteStorage` runs them: no special case. Built in 6b (the store's step and object failure).
+- **Slice 6b D5: persisted run records are documents of their object; one harness per store (owner, 2026-10-27:
+  "sure"):** each unsettled run's record is a keyed persisted document of its object in the engine's namespace
+  `chord.jobs` (owner the object's owner string, kind the job name, key the run id); Chord sets that namespace, a plugin
+  never does, so nothing collides; the state document stays an ordinary document of the run; `finish` deletes the
+  record and retires the state (Q9), so only unsettled runs are stored and in memory; activation loads them through the
+  engine's key listing and a load per run (no new engine read). Durable's tables are named under the type name
+  `pi.durable` (`"session:pi.durable:entries"`; type names are unique per app). One `StoreStorage` per store: a second
+  one on the same store is refused (`invalid/args`), as one host per store (rule 7). Rejected on the way: a table per
+  job, a store-wide runs table, `$`-marked internal names (owner: "if our abstractions can't cleanly support this
+  without $ magic, it's a bad abstraction").
+- **Slice 6b D6: persisted jobs restart as Durable's tasks (owner, 2026-10-27: "yes, same rule for chord"):** at
+  activation a run recorded `running` gets `restarts + 1` (stored) and resumes per its `resume`; a clean close writes
+  its stopped runs back so the next activation counts nothing (as Durable's `writeAtClose`); a `ctx.state.change`
+  resets the count; at five in a row the run ends `failed { kind: "restart_limit", restarts }` (a new `JobError`),
+  `finish` runs, `job_interrupted` is reported. Supersedes design §15's `blocked { restart_limit }` (no parking, as
+  Durable since #11139).
+- **Slice 6b D7: `job.abort(id, ctx): Promise<"marked" | "terminal">` (owner, 2026-10-27: "yes"):** Durable's words
+  and behaviour (`abortTask`): a running run's abort is stored and its signal fired, resolving `"marked"` once `run`
+  settled; a finishing run is only marked; a blocked run is dropped (`"marked"`, as Durable's orphan); no unsettled run
+  with that id resolves `"terminal"` (Chord keeps no settled runs, Q9). Supersedes "job.abort stays until 6b".
+- **Slice 6b D8: deferred persistence of a run's state, per change (owner, 2026-10-27: "agree"):** `ctx.state.change(fn,
+  ctx, { persistence: { kind: "deferred", withinMs? } })`, Durable's `CommitPersistence` shape (default 1,000 ms):
+  adopted and published at once, stored with the next immediate change, before the outcome is recorded, at close, or
+  after `withinMs`; a crash loses what is not stored. Only run state documents for now.
+- **Slice 6b D9: `self.follow(attach)` follows Durable's views (owner, 2026-10-27: "sounds good"):** a generic Chord
+  primitive, no `durableView` module in Durable: `attach(observer, ctx)` returns `Promise<{ value, detach }>`
+  (Durable's `Observation`; its observers have Chord's watch shapes since pi `5f312dac4`). Chord makes the observer,
+  attaches during activation (early calls held, `value` the start value), detaches at the attempt's end; calls inside a
+  batch mark the source in the step, calls outside one are grouped into one batch on the next microtask; a rejected or
+  `undefined` attach fails the activation as a failed dependency; Durable's `failed` end ends the watches `failed`.
+  Returns a `Watchable` (state member, derive source, `on` source). Supersedes the carry-over's `durableView` and D1's
+  `durableView` part.
+- **Slice 8 is "Registries and `host.root`"; the harness object is p3's (owner, 2026-10-27: "we want to get chord done
+  this week. p3 needs design and is next week. just need all chord primitives in"):** Chord builds the primitives the
+  harness needs (registries, `self.writable`, `retryOn`, a `RegistryReader` for Durable, `host.root`, `chord(fn,
+  context)`); the harness object (`Harness.open` over `StoreStorage`, `resume()` after the start barrier, the models,
+  environments and extensions registries) is p3's base code, shown in Chord only as an example or test. Plan: Chord v2
+  (6b, 7, 8, 9) this week, p3's design next week.
+- **Slice 6b R1: retirement per record by `history` (owner, 2026-10-27: "sgtm"; spec review, all four reviewers
+  found that Durable keeps retired records):** the engine's `history` gets three values, set by the adapter at
+  creation and applied at retirement: `none` (Chord's documents and job records: older revisions dropped at a new base,
+  row and revisions deleted at retirement, 6a's behaviour, until now called `latest`), `latest` (Durable's session, task
+  and latest conversation documents: older revisions dropped, the row kept with `retired_at` at retirement, so reads at
+  a point find it), `rewindable` (everything kept). `retireDocument` reads the record's `history`; no flag, archives
+  and replicas carry it. Rejected: keeping every retired record (one rule, but a dead row per finished job run, two
+  with its state, and per retired keyed document, that Chord never reads).
+- **Slice 6b R2: no host kind in store names (owner, 2026-10-27: "what use is host in table names anyways? seems
+  stupid. no host"; supersedes the host-kind part of W7, "Restricted names" and "Slice 6a's three code questions" (3)):**
+  tables are `"<object type>:<table>"` (`"notes.store:edits"`, `"pi.durable:entries"`), document owners
+  `"<object type>"`; a store belongs to one host (rule 7), so the host kind told nothing, and `StoreStorage` and stores
+  used before or without a host get the same names. W7's rule stays: no host instance in a name. Changed in 6a's code
+  in 6b; the applier checks two parts.
+- **Slice 6b: owner names and claims, no `pi.durable` (owner, 2026-10-27: "seems reasonable"; supersedes D2's and D5's
+  `pi.durable` type name and D5's "one `StoreStorage` per store" rule):** every table and document in the store belongs
+  to an owner name, claimed once per store. A `local` object with empty params (P3) claims its type when it first
+  declares persisted data (`self.table`, persisted `self.state`, persisted `self.job`); `StoreStorage.open(store, owner,
+  ctx)` claims `owner`; a second claim of a name is refused (`invalid/args`): a second harness, or a plugin type that
+  meets the harness's name. `StoreStorage` declares its own tables (`entries`, `tasks`, …) through the store, the path
+  `self.table` takes, named `"<owner>:<table>"`, and writes its documents under `owner` in the engine's namespaces
+  (Durable's scopes; corrected 2026-10-27, it was "`durable`"). In p3 the harness object passes its own type (`StoreStorage.open(store, Harness.name, ctx)`; base code gives
+  the store to the core facet); Durable's conformance suite passes a test name. The owner name plays the role of
+  `SqliteStorage`'s `prefix`, checked by the store. Objects never see the store: their API writes to the host's store
+  under their type; a host without a store fails an object declaring persisted data (`broken`, 6a). Rejected: an owner
+  handle (`self.storage`), an indirection that only added protection against trusted code.
+- **Slice 6b R3: a seal is a clean stop for persisted runs (owner, 2026-10-27: "a"):** a persisted run cut off by
+  its attempt's seal while the object continues (a live failure, then a retry) is written back stopped, and the next
+  live attempt resumes it per its `resume` (rerun or abandon) without counting a restart, as after a clean close (D6).
+  In-memory runs keep 6a's rule (`failed { aborted, reason: "restart" }`, finished on the next live attempt).
+- **Slice 6b R4: a follow source's end (owner, 2026-10-27: "yes"):** Durable ends an observer `failed` (its Session
+  failed: the object that opened Durable fails `transient`, its retry reopens its natives, Durable included, and attaches
+  again, as Durable's own recovery is to reopen from Storage) or `ended` (the observed owner ended normally, a task
+  document's task: final, the member keeps its last value, its watches end `ended`).
+- **Slice 6b: claims per table and per document namespace (owner, 2026-10-27: "agree"; refines "owner names and
+  claims"; Fable's second review N2):** what can collide is claimed once per store: a table by its SQL name, documents by
+  `(owner, namespace)`; so the object that opens Durable can also declare its own persisted data under the same owner
+  name, and two harnesses can share a store under two owner names (owner: "seems like they could"); a second
+  `StoreStorage` on the same owner is refused by its tables. "One harness per store" is no rule, only how p3 uses it.
+- **Slice 8 D1: a registry's token is shared, its provider serves it (owner, 2026-10-27: "b", "yes"):** the token
+  `defineRegistry<C, V>(name, { version })` carries identity only (bundled by every contributor, as a contract); the
+  defining plugin's facet provides it with `host.serve(R, { compose, accepts? })`, as it serves object types. One rule
+  for versioned things: a shared definition (object types, registries) keeps its adapters with the provider; a
+  definition of one owner (documents, tables, `json(...)` columns, jobs) keeps them in itself. Refines Q8's "one
+  authoritative declaration" (the serve is it) and design §17's example.
+- **Slice 8: registry failures (owner, 2026-10-27: "ok", "agree"):** contributions never fail a registry: a
+  watchable contribution that fails is left out of the table and reported (`contribution_failed`), back once healed;
+  a throwing `compose` (the owner's bug) is reported (`registry_failed`), its watches get a `failed` call, and `.value`
+  keeps the last good composition (before any, it throws). Derives keep `.value` throwing while failed: state must match
+  its sources, an extension point must stay available.
+- **Slice 8 D2 and D3 (owner, 2026-10-27: "yes"):** D2: a `retryOn` source retries a failed object only on a `value`
+  call; a `failed` call does nothing. D3: `host.root<T>(fn, context, { principal? })` gives `fn` a handler's call
+  context (the host's principal or the given one, this host's incarnation, `context`'s telemetry and signal linked
+  until `fn` settles, `ctx.get`); at settle or abort the context is sealed (`ctx.get` rejects `released`, its references
+  released, their calls reject), so an uncooperative `fn` fails at its next use of Chord; before `load` its gets park;
+  after `host.close` it rejects `released`. `chord(fn, context)` is p3's helper. Closes design §26 #25.
+- **Slice 8 S1: a Session close fails Durable's observers (owner, 2026-10-27: "a"; spec review, all four reviewers):**
+  Durable ends an observer `failed` (error "session closed") when its Session closes, and `ended` only when the
+  observed owner ended (a task document's task); refines R4 (Durable change, upstream). So a follower of a harness
+  reached through a registry fails `transient` when that harness closes, and its retry follows the new one. A
+  `retryOn` wake that arrives while the object activates is kept and retries it at once if that attempt fails.
+- **Slice 8 S2: registry readers of an older version (owner, 2026-10-27: "a"):** as contract state, the provider maps
+  back: `host.serve(R, { compose, accepts: { [old]: { contribution?: (old) => current, value?: (current) => old } } })`;
+  a reader bundling an older token gets the composed value mapped to its version (computed once per composition and
+  version, only while such a reader exists); without a `value` mapping, or for a reader newer than the provider, its
+  value is failed `contract_mismatch` (reported); such a reader fails `broken`, not `transient` (nothing heals it before
+  a reload, which retries broken objects; build review 2026-10-27).
+- **Slice 8 S3: `self.registry` is a dependency, as `self.get` (owner, 2026-10-27: "isn't self.registry meant to wait
+  like self.get?"; my spec had it as a plain read, a mistake against design §6, §7 and §17):** activation waits until
+  the registry has a value (served and composed once; an empty table composes too, at the serve); after `load`'s
+  setups a registry without a value cannot get one before a reload, so a reader then fails at once `transient`
+  (`unavailable/undeclared`) and is retried when the registry gets its first value (R18), as `self.get` of a type not
+  served here fails at once (refined 2026-10-27 after the second spec review: no `readyTimeout` wait at start); once live, a later failure of the registry changes nothing (last good value).
+- **Slice 7b's open points, as recommended (owner, 2026-10-29: "yes"; brief `slice-7b/`):** (1) the API is
+  `host.reload(facets, ctx)`, by plugin name (added, changed; a plugin missing from the list is removed), resolving with
+  a report of what each object did, rejecting with the code error and nothing changed; `load` stays the first call. (2)
+  A `writable` across a pure swap goes back to its initial value (the new factory makes a new one; no positional
+  matching). (3) The rollout across hosts is the app's: it calls `host.reload` on each host in order (server, workers,
+  clients); Chord guarantees per host (staging, commit, `installing`, rollback). (4) No install watchdog: `reload`
+  takes a context and the app passes its deadline. (5) The loader lives in Chord (`chord/next/loader`, slice 7c). (6)
+  Chord ships the app kit as optional subpaths: `loader` and `dev` (7c), `http` and `workers` (slice 10), `web` and
+  `tui` (slice 11); telemetry (slice 9) last.
+- **Slice 7b's build decisions (owner, 2026-10-29, answering the builder; `slice-7b.md` §13):** a loaded plugin passed
+  as the same facet object (`===`) is unchanged and untouched, any other facet value for a loaded name is changed;
+  activating (not parked) and backoff-waiting objects of a reloaded plugin are retried; the report's `parked` covers
+  swaps and retries (their first dependency check), restarts are reported at once; a swapped-out attempt is sealed
+  once its calls settled (bounded by `closeTimeout`) and the swap ended, its job invocations finishing on their old
+  code; a stuck old routine call is reported `drain_timeout` and fenced by the old routine calls' shared token; a swap
+  to another variant sends holds a fresh `bound`; a native restart ends in-memory runs `aborted { reload }` while
+  persisted ones follow 6b R3 (stopped, resumed per `resume`, no restart counted); staging is synchronous
+  (`installing` tested from a staged factory); a removed object's member sources and pinned keys are handed to the next
+  object of its identity (fix round 3: one hand-over per identity for removal, version refusal and an object ending
+  while requests wait, `slice-7b.md` §13 item 11); keyed members' versions are built in 7b (L1's keyed edits and an accepts `keyed` section,
+  decision "Keyed state members, local contracts only"). The builder's own choice, accepted by the owner (2026-10-29):
+  adapted state members are derives per object and version, not per binding. (**Superseded in part** by "References
+  are the only indirection": the hand-over of member sources and the per-version sources that outlive an object go.)
+- **References are the only indirection (owner, 2026-10-29: "go"; after seven fix rounds of 7b found one edge case after
+  another in sources handed between objects):** supersedes in part 6a's "members across attempts" (one member source
+  per object and member name) and slice 7b decisions 8 and 11 (member sources and pinned keys frozen and handed to the
+  next object of the identity; per-version outward sources owned by (identity, version); `host/handover.ts`). The
+  problem: a consumer's watch or derive over `ref.count` was attached to the referenced object's own document or derive
+  (the reference was bypassed), so every change of what the reference points at needed a stable node somewhere else
+  (`MemberSource` on the object, then sources that outlive the object and move to the next one). The rule: (1) a
+  consumer's watches and derives over a referenced object's member attach through the reference's member, which passes
+  the subscription straight through to the object's own document or derive (no extra hop on commits). (2) When what the
+  reference points at changes (a new object instance after a factory re-run: reload, retry, restart; a new object
+  after the type was removed and served again; another variant), the reference moves its subscriptions to the new one
+  and sends one frame, a diff from the last value. (3) While it points at nothing, its members keep their last values
+  (a pointer, no copy): while loading (a restart, a retry, a swap whose new instance is not live yet) its watches get
+  no call; while failed (a live failure, its version refused, its type removed, a failed dependency) one `failed` call
+  with the cause's error, and they stay open (replaces 6a's "no frames while failed"); a reference that never had a
+  value reads `not_ready` while loading and its failure's error while failed, and its watches wait for its first values
+  (a member the new variant lacks fails `invalid/member`, as before). Keyed watches and pins re-pin on each new instance the same way (the
+  cross-attempt key sources of 6a go; a key keeps its last value until the new instance loaded it; a dependent's
+  factory pin is still loaded before the dependent goes live). Once hydrated, a reference has last values for every state member of its bound variant, read or not: when it
+  detaches it takes them at its version from the outgoing instance (through that instance's mapping for an older
+  version), keeping no node of it. After a `failed` call, the next good value arrives as `[["r", value]]` even when
+  unchanged; a watch opened while failed starts at the last value and gets the failure once. No source, mapping,
+  document handle or pin of an instance outlives it through a reference: a detached reference keeps only plain last
+  values and its failure; releasing it drops them and its bindings; stopping a keyed watch drops its pin. (4) The same rule over a link: a replica keeps its last values
+  readable while its hold is failed. (5) An older consumer (`accepts`) attaches to the object instance's shared mapping
+  for its version: per member one derive `(current) => old`, made on first use, dropped when no reference of that
+  version is left, gone with the instance (one map and one diff per commit per version, whatever the number of old
+  references); a version the instance does not accept gives no member (unbound, last values kept). A reference knows
+  its version from the contract token it was made with. Nothing outlives its object instance; nothing is handed over.
+  Kept: requests never end on a code change, healing on rebind, `accepts` for arguments and results. A simplification
+  audit of slices 6a to 7b follows 7b's commit (owner: "how much other such bullshit was added in the last slices").
+  Refined after the gap checks (Astra, Sol, Opus) and the build (owner, 2026-10-29: "i accept the recommendations"):
+  a detaching reference follows the old instance until it stops changing (its seal after admitted commits, a restart
+  after its drain), then takes its last values for every member of its bound variant, read or not, never from an
+  instance it never followed; after a `failed` call the next good value is `[["r", value]]`; a watch on a reference that
+  never hydrated resolves at its first binding (rejects on release, revocation, close, abort); release drops last
+  values and bindings; registry values and job state are not affected. **Derives over a failed reference member compute
+  on its last value** (G2 (A), as 6a): a contribution built on it stays in its table; only the reference member's own
+  watches get the `failed` call, and `ref.state` shows the failure. **Activation churn +9.6% accepted** (CPU 22, 104.7-107.9
+  → 114.7-118.3 µs, allocation equal): an object whose derive reads another object's member makes one pass-through
+  node per reference member per instance; calls, commits, links and memory are within the bar. Two references to one
+  key hold two pins (counted on the key's one source; the document is loaded and kept once). **Binary append commit-to-frame
+  median +10% accepted** (owner, 2026-10-29; CPU 10, 0.031 → 0.034-0.035 ms): equal with the young generation pinned, fewer
+  scavenges over the whole benchmark (V8's young-generation sizing, slice 7b fix round 3).
+- **Per plugin at startup and reload (owner, 2026-10-30: "yes", "1. lgtm 2. yes"; analyses
+  `/tmp/per-plugin-{opus,fable}.md`):** supersedes "Rollback is all-or-nothing per host" (2026-10-2x, 7b §2, design §21)
+  and 7c's Q2 ("a facet throwing while evaluated fails its host's whole step"). Why all or nothing was chosen: per plugin
+  was decided first and p2's plugin reviewers found counter-traces (a dropped argument field written into a transcript; a
+  copied Durable document written by two versions; a provider's failed factory leaving the harness hanging; mixed copied
+  code and registries); v2 has since closed them (closed argument schemas for every caller, Q12, Q15; version binding
+  with waiting, 7a; ownership of documents; registry versions with `accepts`, Q8; copied cross-plugin files limited to
+  contracts without dependencies, 7c). Rules: (1) **at startup** a plugin whose build, evaluation or setup fails is left
+  out; `load` resolves with a report `{ failed: [{ plugin, error }] }` and never closes the host for it (the core facet
+  included: base code decides whether that is fatal); its consumers wait `failed { waiting }` as for any missing plugin.
+  (2) **At reload** a plugin whose new code fails (build, evaluation, setup, a factory in staging, a declaration error,
+  `checkAccepts`) keeps its old code (its loaded facet, unchanged), and every other plugin of the reload applies; the
+  report lists it (`failed: [{ plugin, error }]`, as `load`'s; an added plugin that fails is left out); staging retries without it. (3) **The closure rule** (Opus): after
+  staging, a changed plugin whose recorded requests would not bind because the plugin they need was kept old or left
+  out is kept old too, so a consumer edited together with a broken provider keeps working on its old code. (4) What no
+  rule detects: a consumer relying on new behaviour of a kept provider whose contract (version, fingerprint) did not
+  change: the same risk as a rollout across hosts, documented. (5) `rollout` keeps a plugin dirty while it was kept old
+  on any host. Built with slice 7c (the kernel's `load` and `reload` change with it).
+- **Slice 7c's points (owner, 2026-10-30; `slice-7c.md` §5):** (1) esbuild is an optional peer dependency of Chord,
+  imported only by the plugins component. (2) **No dev/prod split** (owner: "chord apps are supposed to not have a
+  prod/dev split. they are supposed to be self modifying applications"): watching, rebuilding and rolling out are core
+  machinery; one component `chord/next/plugins` (discovery, build, evaluation, `pluginFile`, the watcher, `rollout`) in
+  `src/next-node/plugins/`, exported with v2's entry point; it turns V8's compilation cache off when created; reloads
+  stay explicit (the watcher marks, never applies). Supersedes the separate `loader` and `dev` subpaths of "Slice 7b's
+  open points" (5), (6). (3) `installDependencies(plugin, ctx)` as coding-agent installs package dependencies (`npm
+  install --omit=dev --legacy-peer-deps --ignore-scripts --no-audit --no-fund` in the plugin's real directory, the
+  command overridable). (4) Cross-plugin imports: any file of a discovered plugin, copied, documented as contracts and
+  side-effect-free modules only, listed by the build, no static check yet. (5) `pluginFile` answered per facet by the
+  `require` evaluation passes.
+- **A plugin's npm dependencies are bundled; external only by opt-in (owner, 2026-10-29: "explicit opt in + (a)"):**
+  a plugin's `dependencies` are installed into its own `node_modules` (`npm install --ignore-scripts`) and bundled into
+  each facet that imports them (host packages, its `peerDependencies`, stay external and are passed in). On Node a
+  plugin may keep named packages external with an explicit list in its `package.json` (`"chord": { "external": [...] }`):
+  server and worker facets then load them from the plugin's `node_modules` (`createRequire`, as pi 1.0 loads extension
+  dependencies), native addons included; they stay in Node's module cache until the process ends, so a new version
+  takes effect after a restart. A browser or TUI facet importing an external package fails to build. Slice 7b
+  (the loader).
+- **The dependency model is decided (owner, 2026-10-29: "just build this"):** `packages/chord/docs/next/dependencies/model.md`
+  (explainer `book.md`, `index.html`) as decided, with its remaining four points taken as recommended: (1) the barrier
+  is (a), `load` resolves at the first outcomes of this host's host-lifetime objects (local blockers still in their
+  first attempt are waited for; waits on other hosts or failed dependencies end the first pass); (3) `waiting` is a new
+  `FailureCause` kind; (4) a pure swap whose new factory needs a missing dependency parks the object, no overlap of old
+  and new code; (5) a registry's last good value is kept only while every contribution it was built from is still in
+  the table. Supersedes R18's dependency deadline and backoff, S2's `broken` and S3's backoff, §7's throw for a missing
+  local type and getters' rejection, §21's `gone` on removal and its rollout `updating` deadline, the start barrier's
+  admission gate (holds wait only for the publication). Built as slice 7a (`slice-7a.md`); design.md is folded with
+  the build.
+- **Cycles across hosts: no probe, a diagnostic (owner, 2026-10-29: "yes"; dependency model, decision 6):** cycles stay
+  found as today: on one host by the walk over waiting edges at `self.get` (exact), across hosts by the activation chain
+  in holds (objects that start one after another). The remaining gap, a ring across hosts whose objects start at the
+  same moment, is not detected: under the dependency model, which has no dependency deadline, such a ring stays parked.
+  It is made visible: an attempt parked longer than its `readyTimeout` on a remote attempt that is itself only
+  `loading` is reported once per parking episode as `HostError` `parked_long { object, waitingFor, since }`; nothing
+  fails or retries. A cycle is a plugin bug (owner: "if no plugin bug, we don't need it"); the guide's rules for plugin
+  authors and agents: (1) a factory declares only what the object needs, never a type that needs it back; (2)
+  back-references and occasional lookups go into methods and routines (`ctx.get`); (3) data flows up through state and
+  registries, not mutual `self.get`; (4) host-lifetime objects on the server never declare worker types in their
+  factory. Rejected: the probe (edge-chasing searches with a check along the recorded trail, `/tmp/model/review*`,
+  seven review rounds; complete only with a re-search timer or a full search lifecycle, the most intricate code in
+  Chord for a plugin bug) and the slice 4b timeout narrowed (it polls chains across hosts again, misses a ring of
+  waiting attempts, and retries in lockstep without finding the ring). Supersedes slice 4b review decision (2)'s
+  timeout once the dependency model is built (slice 7); folded into design §6 with it.
+- **Getters wait through `waiting` (owner, 2026-10-29: "(b) with a default seems fine; UI stays responsive anyways
+  because it usually holds instead of get"; dependency model, decision 2):** `host.get`, `ctx.get` and `host.registry`
+  wait while the reference is `loading`, `failed { transient }` or `failed { waiting }`, bounded by their
+  `readyTimeout` (default 60 s; callers choose their own), and reject at the deadline with the last cause; only
+  `failed { broken }` rejects at once. Calls stay as they are: on a `loading` reference they park, bounded; on a
+  `failed` one (any cause) they reject at once. A UI holds (`host.hold`) and shows `ref.state`; code that needs the
+  object now gets it. Reviewers (`/tmp/model/stw-*.md`): Fable (b, calls included), Opus (a, plus a `whenLive`
+  helper), Sol and Astra (c: callers park until their own context aborts, with caller deadlines and caps on pending
+  calls; (b)'s default deadline is that cap). Sol's p2 note: cleanup in a `finally` after an abort needs its own
+  bounded context, not the aborted one.
+- **Only hosts with an address serve remote types (owner, 2026-10-29: "b"):** a host serving a `remote` type needs an
+  address and a principal; `load` refuses a facet that serves one on a host without an address (until now a host with
+  a principal but no address served remote types and placed every one of them "here"). So "here" is decided by the
+  address alone, as the host address of the type. Holds carry their `address` always (required on the wire).
+- **`hostAddress` instead of `placement` (owner, 2026-10-29: "yes, rename"):** the field of a `remote` contract that
+  computes where its object lives is `hostAddress: (params) => Address` (it returns the address of the host that serves
+  the object, the vocabulary of `createHost({ address })`, routes and holds); supersedes the name of "`placement`, not
+  `host`" (2026-10-21). The error reason `invalid/placement` is `invalid/host_address`; the internal module that decides
+  where a request goes (`host/placement.ts`, `Placement`) is `host/destination.ts`, `Destination`. Earlier entries' and
+  slice specs' "placement" reads "host address"; they keep their wording as history.
+- **Every remote type declares its placement (owner, 2026-10-29: "yes, let's remove it"):** `placement` is required in
+  `remote()` (a type error without it, and a declaration error at runtime); a remote type without placement, a leftover
+  of slice 3a (remote objects over one link, before host kinds in 4a), is gone, and with it the fallback "here if served
+  here, otherwise the parent" and its re-placement at the first parent link. Every remote request is placed by its
+  address alone (dependency model, `packages/chord/docs/next/dependencies/`). Tests and examples get `placement: () =>
+  Server()` or their own host kind.
+- **No client providers for now (owner, 2026-10-28: "yeah, no client providers for now"; reviews
+  `/tmp/barrier-{astra,fable,opus,sol}.md`):** clients stay unaddressable and serve only `local` types (design §3).
+  Client-side capabilities (a phone's camera, clipboard, a page's WebMCP tools) go through an owner's state, as the
+  Questions service: a tool asks an owner store (`request`, `wait`), clients watching its open requests carry them out
+  and answer with a method call (the answer is method arguments, checked against the owner's schema; bytes as `bytes()`
+  leaves, chunked if large); a client may advertise the tools it can run to such a store, tied to its presence. Why:
+  a client as a provider would feed untrusted results, state and ops into server and worker objects (consumers never
+  validate them), needs client addresses, routing down through relays and a principal for clients; the owner pattern
+  needs nothing new in Chord and survives link drops and several devices by the owner's rule.
+- **Design audit of slices 1-6a (owner, 2026-10-27; `/tmp/design-audit-{opus,sol}.md`):** the built code follows the
+  design except for five bugs, fixed after 6b's commit with the auditors' reproductions as tests: on a failed
+  activation references are released after the natives closed (§6, §13); a dependency going live while the dependent
+  activates retries it (R18, the wake remembered); a call on a `local` object runs with the host's incarnation (§4); a
+  retirement of an unloaded document checks its stored version and fingerprint (§9, R15); `ref.retry()` holds a refused
+  hold again with a new id. Two choices: (6, "a") a link drop while a remote dependency is still loading leaves the
+  dependent `loading` until `readyTimeout` (§6; supersedes slice-3b race 18's transient failure); (7, "a") `host.hold`
+  and `host.get` check params at once, also before `load`; "fails once `load` resolved" stays only for a local type
+  not served here (§7). Stale design text updated: `mapShared` per array, job runs keeping a failed object alive only
+  while an attempt is live or activating, `ctx.state.change(fn, ctx)`, revocation closes child links, routes take a
+  context, §22's `revoke`/`chain`/`limit`, native watches collapsing only past 100 pending values.
+- **Slice 6b: numbers accepted (owner, 2026-10-27: "yeah the reopen times are ok"; "i accept the 12%": resuming a
+  conversation watch 20 entries back costs about 12% more CPU on `StoreStorage`, once per reconnect, about 0.1 ms per
+  mount, from the extra promise per read in the fork scan):** reopening a store with
+  `StoreStorage` costs about 0.15 ms more than `SqliteStorage` once per open (0.28 to 0.43 ms: six table declarations,
+  the allocator read, compiling the reads); the one-entry commit's mean is raised by one outlier among 20 samples while
+  its p75 is equal or lower. Neither is a hot path or a steady regression. Accepted by the redesign session in fix
+  round 1 and shown to the owner (not his quote): `StoreStorage.close` waits for its commits only (its reads go straight
+  to the store, which stays open).
 - **The performance and memory bar, and converging reviews (owner, 2026-10-27: "yes"):** supersedes "as good as
   HEAD in everything" for Chord v2 slices and pi changes. CPU: each hot path (calls, changes, watches, links) within
   about 5% of HEAD, measured in bursts with alternating processes pinned to one CPU; worse is fixed or goes to the
@@ -2003,6 +2298,81 @@ validation and copies the v2 kernel added around Delta.
   descriptions on the wire (the `describe` message kind of R1 and the per-link description cache go away), R3 is moot,
   the coverage check across fingerprints of one version is gone.
 
+## Simplification audit (2026-10-30)
+
+The owner asked, after slice 7b's seven fix rounds, how many other mechanisms serve a rare case at a high cost. Audits
+by Opus and Sol (`/tmp/audit-{opus,sol}.md`) and this session; each item decided by the owner with its code and case.
+
+- **A1, `installing` is cut (owner, 2026-10-30: "cut"):** model §1's state for a hold or request that does not fit the
+  running code while a reload stages: staging is synchronous (`stagePlugins`, `recordFactory`), so no message or caller
+  can arrive while it runs (the only test reached it from a factory calling back into the host). The `Serving` kind, the
+  host's map, `Hold.start`'s branch and the test go. During the app's bundling before `host.reload` the old code
+  answers a mismatch `failed { waiting }` until the commit wakes the request (model §5's accepted gap). Supersedes
+  model §1's `installing` row and design §21's installing sentences.
+
+- **A2, static registry cycle edges are cut (owner, 2026-10-30: "yeah cut"):** the edges a contribution of another
+  registry's value recorded (`RegistryEdge`, `#reads` counts, `assertNoCycle`, `#reaches`, an attempt's pending edges,
+  staging's edges) go; the runtime guard stays (a registry read while it composes throws `invalid/cycle`; the
+  contribution that read it is left out and reported `contribution_failed`). A ring of registries is caught at its first
+  composition instead of at `self.contribute`: the contributing object goes live, the rest of the registry works.
+  Supersedes slice 8's "a cycle of registries reading each other refused when the second one serves or contributes".
+
+- **A3, routine calls keep their ops (owner, 2026-10-30: "keep"):** `self.on` handlers keep `{ value, ops, retired }`
+  with the routine's own folding (`PendingOps`, the basis after a throw).
+
+- **A4, cross-host activation chains stay (owner, 2026-10-30: "yep keep"):** they catch the common, sequential form of a
+  cross-host dependency ring (one request whose activation creates the other side) with an immediate `invalid/cycle`
+  naming the path; `parked_long` stays the slow net for the rare simultaneous race.
+
+- **A5, retry propagation by a hop budget (owner, 2026-10-30: "b if correct"):** `ref.retry()` still passes on from a
+  parked object to its failed dependencies (model §3.7), but its dedupe is simpler: on one host one retry's walk keeps a
+  visited set (a diamond retries a shared dependency once); across links the `retry` message carries a hop budget (an
+  integer, 16 from the first host, one less per host, dropped at 0) instead of the operation id (uuidv7), the objects'
+  last-8 remembered ids and the `through` list. Bounded effects, both harmless: a diamond across hosts may send a shared
+  dependency two retries (the second meets it activating and is ignored, or starts one more attempt if the first
+  already failed); a waiting ring across hosts (the undetected simultaneous cycle) passes the retry round until the budget
+  runs out, starting no attempt (parked objects only pass it on). Instance ids stay (activation chains, A4).
+
+- **A6, staging factories against a recording `self` stay (owner, 2026-10-30: "keep"):** a throwing new factory keeps
+  rejecting the whole reload (the host stays on its old code), and each object's fate is decided from its recorded
+  declarations before the commit.
+
+- **A7, registry last-good with provenance stays (owner, 2026-10-30: "a").**
+
+- **A8, deferred job-state persistence keeps its held ops (owner, 2026-10-30: "keep").**
+
+- **A9, a pure swap sends holds a fresh `bound` (owner, 2026-10-30: "simplify"):** a hold over a link whose object
+  swaps in place gets a fresh `bound` (one snapshot of its members), the path a restart, a variant change and a version
+  change already take, instead of a re-subscription with `[["r", value]]` per changed member (`Hold.#rebound`, its
+  constant-to-source and failed-member cases, `currentOf`). A tab's watchers may get one frame for an unchanged member;
+  nothing is lost or stale. Supersedes design §21/§22's per-member `r` rule for holds after a swap.
+
+- **A10, one rule after a live failure (owner, 2026-10-30: "simplify"):** every member of a failed live instance keeps
+  being followed (references and holds) until the commits it admitted published (`documents.settled()`), then all stop:
+  the restarts' rule. The "own" against "foreign" split (`#follows === "own"`, `Attempt.owns` and its mapping-derive
+  case, `Hold.#stopForeign`) goes; a re-exposed member of another object may show one more change in that window.
+  Refines 6a's build-review rule "members following another object's sources freeze at once".
+
+- **A11, `parked_long` widened (owner, 2026-10-30: "widen"):** reported once per parking episode when an attempt has been
+  parked longer than its `readyTimeout`, whatever its blocker (the first in declaration order named, with its state);
+  the remote-loading condition, `heldOnLink` and the clock restart at a link go. Also covers a cross-host ring one of
+  whose members waits on a failed dependency. Supersedes decision 6's narrow condition.
+- **A12, the routine fence token folds into the seal (owner, 2026-10-30: "fold"):** one seal token per attempt; after a
+  swap the old routine calls get `closeTimeout` to finish, then the whole old attempt is sealed (its method calls had
+  the same bound). `RoutineContext.fence` and the token choice per transaction go. Supersedes slice 7b decision 4's
+  separate token.
+- **A13, the table version fence stays (owner, 2026-10-30: "keep"):** an old call stuck past a restart's drain never
+  issues SQL against a migrated table (which would stop the store and close the host).
+- **A14, key pins keep their hand-over between instances (owner, 2026-10-30: "keep").**
+
+- **A15, keyed members across objects stay, with their versioning (owner, 2026-10-30: "keep essential"):** they fill
+  the gap P3 creates (a view with params following one entry of a persisted store live); the alternatives (a singleton
+  map, a method) are weaker.
+
+Summary: cut A1 (`installing`), A2 (static registry cycle edges); simplified A5 (retry hop budget), A9 (a fresh `bound`
+after a swap), A10 (one rule after a live failure), A11 (`parked_long` widened), A12 (one seal token); kept A3, A4, A6,
+A7, A8, A13, A14, A15.
+
 ## Portability boundaries in the kernel
 
 From `research/chord-on-durable-objects.md`, adopted for the Chord v2 kernel because they cost little and help tests:
@@ -2054,7 +2424,7 @@ From `research/chord-on-durable-objects.md`, adopted for the Chord v2 kernel bec
 
 - **Per host:** load (bundle; a load error rejects) → staging (run the facet setup and every live object's new factory
   with a recording `self`, declarations only, nothing activated; a throw rejects) → commit (atomic) → after.
-- **Rollback is all-or-nothing per host:** any load or staging error leaves the host entirely on its previous code.
+- ~~**Rollback is all-or-nothing per host:**~~ (**superseded** by "Per plugin at startup and reload", 2026-10-30) any load or staging error leaves the host entirely on its previous code.
   A host is completely at revision R or R−1, so status per host suffices.
 - **Pure objects** (**superseded in part** by R15 (old code touching a document migrated past its version throws)) (no `self.open`, old or new) are swapped in place: new methods and derives; documents, references
   and jobs stay; routines restart serialized; new references become live; then the object's gate opens. Running calls
@@ -2197,6 +2567,10 @@ Everything else from earlier lists is decided (see the entries above and `packag
 - **Future goal: deploy Chord apps to Cloudflare Durable Objects and similar platforms.** Hot reload there is not
   needed; composition through plugins is (plugin set fixed at deploy). Research in `research/chord-on-durable-objects.md`.
 - Deferred until a concrete case: jobs as objects and where a flow lives (when login is ported); project plugins.
+- **Every object may contribute** (owner, 2026-10-29: "note it down as something to consider for the future; can be
+  changed later without a need for migrations"): lift R21 so objects with params and `remote` objects contribute too;
+  the entry lives while the object is live, its identity is the object's (type, params, principal key); `contribute`
+  on every `self`. Not decided; R21 stands.
 - p3 domain points (decided per domain when p3 is designed): `SessionFiles {session}` (proposed), session delete,
   connection pools, config files with a single writer, file formats as versioned interfaces, the terminal host
   process as a revision artifact.

@@ -1,10 +1,17 @@
 // Hosts (§3): `createHost`, loading facets and the start barrier, links to children, the parent (connected again after
 // a drop) and routes, the origins it relays holds for, getting and holding references as a principal, the heartbeat
-// of every link, revocation (§4), presence (§19) and keep-alive counts, closing; one batch per host, the backoff map
-// and the endings new instances wait for.
+// of every link, revocation (§4), presence (§19) and keep-alive counts, registries and root scopes (slice 8), reloads
+// (slice 7b: staging, the commit, each object's fate, the report), closing; one batch per host, the backoff map and the
+// endings new instances wait for.
 
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
-import { BACKGROUND_CONTEXT, type Context, withAbortSignal, withoutAbortSignal } from "../../context/index.ts";
+import {
+	awaitWithContext,
+	BACKGROUND_CONTEXT,
+	type Context,
+	withAbortSignal,
+	withoutAbortSignal,
+} from "../../context/index.ts";
 import type { JsonValue } from "../../json.ts";
 import type { Watchable } from "../../watch.ts";
 import type { Address, Contract, HostKind, ParamsOf } from "../contracts/index.ts";
@@ -12,7 +19,7 @@ import { contractData, type Params } from "../contracts/internal.ts";
 import { ChordError, type FailureCause, type Principal, type PrincipalKeyFunction } from "../data/index.ts";
 import {
 	asChordError,
-	bindProvider,
+	binds,
 	canonicalJson,
 	checkParams,
 	identityKey,
@@ -21,6 +28,9 @@ import {
 } from "../data/internal.ts";
 import { binaryCodec, type Codec, type Compression, type Link, type PartLimits } from "../link/index.ts";
 import { linkLimits } from "../link/internal.ts";
+import type { Registry, RegistryValue } from "../registries/index.ts";
+import type { RegistryValueSource } from "../registries/internal.ts";
+import { type RegistryContribution, type RegistryError, RegistryRecord } from "../registries/internal.ts";
 import {
 	type HoldRequest,
 	HostLink,
@@ -28,21 +38,26 @@ import {
 	Path,
 	type ProviderSide,
 	RemoteObject,
+	type Upstream,
 } from "../remote/internal.ts";
 import { Batch, type BatchError } from "../state/internal.ts";
 import type { ChordStore, Store } from "../store/store.ts";
 import { Activity, type ActivityCounts } from "./activity.ts";
-import { notLive } from "./attempt.ts";
+import { type Attempt, notLive } from "./attempt.ts";
 import { Backoff } from "./backoff.ts";
-import { type Caller, withLinkedAbortSignal } from "./ctx.ts";
-import { type Facet, type ServedEntry, setUp } from "./facet.ts";
+import { type Caller, type Ctx, withLinkedAbortSignal } from "./ctx.ts";
+import { Destination, type Placed } from "./destination.ts";
+import type { Facet } from "./facet.ts";
+import { contributionOf } from "./members.ts";
 import type { CloseFailed } from "./native.ts";
-import { ChordObject, type Holder, type LocalContract, type RemoteContract, type Served } from "./object.ts";
-import { type Placed, Placement } from "./placement.ts";
+import { ChordObject, type Holder, type ReloadFate, type Served } from "./object.ts";
 import { type Presence, References } from "./presence.ts";
 import { Binding, type CheckedParams, type Held, type Reference, type Target } from "./reference.ts";
 import { RevocationKeys, type RevokedBy } from "./revocation.ts";
+import { type RootOptions, RootScopes } from "./root.ts";
 import { Route, type RouteOptions } from "./route.ts";
+import { type PluginFacet, recordFactory, type Staged, type StagingHost, stagePlugins } from "./staging.ts";
+import { UnboundIndex, type UnboundRequest } from "./unbound.ts";
 import { uuidv7 } from "./uuid.ts";
 
 /** What `createHost` takes; `R` is the app's revocation type (JSON). */
@@ -93,6 +108,7 @@ export type Position = { readonly kind: "on" | "onLive" | "native"; readonly pos
  */
 export type HostError =
 	| BatchError
+	| RegistryError
 	| { readonly kind: "activation_failed"; readonly object: string; readonly failure: FailureCause }
 	/** A live object failed at runtime (a `migrate` failing on access, a stored version newer than the code). */
 	| { readonly kind: "object_failed"; readonly object: string; readonly failure: FailureCause }
@@ -126,8 +142,29 @@ export type HostError =
 			readonly id: string;
 			readonly error: unknown;
 	  }
+	/** A persisted run was cut off five times in a row by crashes (D6): it ends `failed { restart_limit }`, `finish` runs. */
+	| {
+			readonly kind: "job_interrupted";
+			readonly object: string;
+			readonly job: string;
+			readonly id: string;
+			readonly restarts: number;
+	  }
 	/** A blocked run was dropped without `finish`: aborted, or its object ended. */
-	| { readonly kind: "job_dropped"; readonly object: string; readonly job: string; readonly id: string };
+	| { readonly kind: "job_dropped"; readonly object: string; readonly job: string; readonly id: string }
+	/**
+	 * An attempt parked longer than `readyTimeout` (since `since`, `Date.now()` time), whatever its blocker: once per
+	 * parking episode, naming the first blocker in declaration order (`waitingFor`, a reference's label or `registry
+	 * <name>`) and its `state`; a diagnostic of a ring across hosts started at the same moment or a long wait (nothing
+	 * fails).
+	 */
+	| {
+			readonly kind: "parked_long";
+			readonly object: string;
+			readonly waitingFor: string;
+			readonly state: "loading" | "failed";
+			readonly since: number;
+	  };
 
 /**
  * What `accept` and `connect` take: the principal of the host at the other end, as this host stamps it; `trusted` skips
@@ -155,26 +192,44 @@ export type GetOptions = {
  * A host whatever its principal type, as Chord's own parts use it: `ChordHost<P>` is invariant in `P` (`load` takes
  * facets typed for exactly `P`).
  */
-export type AnyHost = Omit<ChordHost, "load" | "accept" | "connect" | "route" | "references">;
+export type AnyHost = Omit<ChordHost, "load" | "reload" | "accept" | "connect" | "route" | "references" | "root">;
 
 /** A host. `P` is the app's principal type, `R` its revocation type. */
 export interface Host<P extends Principal = Principal, R extends JsonValue = JsonValue> {
 	/**
-	 * Runs every facet's setup, then activates every served type with empty params and resolves when each has had its
-	 * first outcome, live or failed (the start barrier; failures go to `onError`). A setup that throws rejects it and
-	 * closes the host. Runs once.
+	 * Runs every facet's setup and publishes what they declared in one batch (the types and registries served, the
+	 * registries composed once, the contributions); requests that waited for the publication are placed after that
+	 * batch. Then activates every served type with empty params and resolves when each has had its first outcome (the
+	 * start barrier, decision (a)): live, failed by its own cause, parked with no blocker here still without its first
+	 * outcome, or ended (failures go to `onError`). A setup that throws rejects it and closes the host. Runs once.
 	 */
-	load(facets: readonly { readonly name: string; readonly facet: Facet<P> }[], context: Context): Promise<void>;
+	load(facets: readonly PluginFacet<P>[], context: Context): Promise<void>;
 	/**
-	 * A reference once its object is live; waits for `load` first. It acts as the host's principal and goes where its
-	 * type's placement puts it: here, over a route, or over the parent link (`Placement`). A broken failure rejects at
-	 * once; through transient ones it waits until its deadline, then rejects with the last failure's error.
+	 * Reloads this host's plugins (slice 7b): `facets` is its complete new plugin set; a plugin in it and not loaded
+	 * is added, one loaded with another facet value is changed (the same facet object is unchanged: untouched), one
+	 * loaded and not in it is removed. Staging runs every setup and every affected object's new factory against a
+	 * recording `self`; any throw rejects it and nothing changed. Then it commits in one batch (types, registries,
+	 * contributions; a publication waking the requests for the names it serves) and every object of a changed or
+	 * removed plugin takes its fate: swapped in place, restarted after its drain, retried, or ended (its type
+	 * removed). Resolves with the report once every fate started (swaps and retries checked their dependencies; it
+	 * does not wait for objects to go live). Reloads run one after another. Throws before `load` resolved; rejects
+	 * `released/closed` after `close`; `context`'s abort before the commit rejects `aborted` and changes nothing, after
+	 * it only ends the wait.
+	 */
+	reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport>;
+	/**
+	 * A reference once its object is live (and hydrated). It acts as the host's principal and goes where its type's host
+	 * address puts it: here, over a route, or over the parent link (`Destination`). It waits while the reference is
+	 * `loading` (before the host's publication too), `failed { transient }` or `failed { waiting }` until its
+	 * `readyTimeout`, then rejects with the last cause and releases the reference; a broken failure rejects at once.
 	 */
 	get<C extends Contract>(Type: C, params: ParamsOf<C>, context: Context, options?: GetOptions): Promise<Reference<C>>;
 	/**
 	 * A reference at once, following its object until released: loading, live, failed (retried as its object is) and
-	 * loading again while its link is down; it never rejects. Throws at once for invalid params and a local type not
-	 * served here; before `load` resolved these are decided once it did, failing the reference broken. Its `variant` is `undefined` until its first binding.
+	 * loading again while its link is down; it never rejects. Throws at once only for invalid params (also before
+	 * `load`). A type not served where it goes is `loading` before the host's publication and `failed { waiting }` after
+	 * it (bound when a publication serves it); a `hostAddress` or route that refuses fails it broken. Its `variant` is
+	 * `undefined` until its first binding.
 	 */
 	hold<C extends Contract>(Type: C, params: ParamsOf<C>, context: Context, options?: GetOptions): Held<C>;
 	/**
@@ -219,11 +274,84 @@ export interface Host<P extends Principal = Principal, R extends JsonValue = Jso
 	 */
 	readonly activity: Watchable<ActivityCounts>;
 	/**
-	 * Closes its links, then ends every object at once, then drains and closes them one by one, the last to go live
-	 * first (reason `close`). Rejects with an `AggregateError` of the closes that threw.
+	 * Registry `R`'s composed value as `R`'s version sees it, for code outside objects, once it is usable: waits for the
+	 * host's publication, then while it has no value (`unavailable/undeclared` without a provider, a first `compose`
+	 * that threw, a version not served here: `contract_mismatch`) until its `readyTimeout`, then rejects with the last
+	 * error.
+	 */
+	registry<C, V>(R: Registry<C, V>, context: Context, options?: GetOptions): Promise<RegistryValue<V>>;
+	/**
+	 * Runs `fn` with a call context for code outside objects (a Durable tool, a CLI): the host's principal (or
+	 * `options.principal`), this host's incarnation, `context`'s telemetry and signal, `ctx.get`. When `fn` settles or
+	 * `context` aborts, the context is sealed: its signal aborted, `ctx.get` refused `released`, every reference it took
+	 * released; an abort rejects at once. `host.close` seals the open ones; after it, `root` rejects `released`.
+	 */
+	root<T>(fn: (ctx: Ctx<P>) => Promise<T>, context: Context, options?: RootOptions<P>): Promise<T>;
+	/**
+	 * Closes its links, seals its root scopes, then ends every object at once, then drains and closes them one by one,
+	 * the last to go live first (reason `close`). Rejects with an `AggregateError` of the closes that threw.
 	 */
 	close(context: Context): Promise<void>;
 }
+
+/** What a reload did (slice 7b §1): its plugins by change, and what every affected object did. */
+export type ReloadReport = {
+	readonly plugins: {
+		readonly added: readonly string[];
+		readonly changed: readonly string[];
+		readonly removed: readonly string[];
+	};
+	/** Every live, activating, parked or failed object of a changed or removed plugin, by its label. */
+	readonly objects: readonly ReloadedObject[];
+};
+
+/**
+ * One object's fate in a reload: `swapped` (pure, in place), `restarted` (natives: drained, closed with reason
+ * `reload`, activated again), `ended` (its type is gone), `parked` (its new code waits for a dependency, `cause`), or
+ * `retried` (it was failed, parked or activating: a new attempt runs on the new code).
+ */
+export type ReloadedObject = { readonly object: string } & (
+	| { readonly kind: "swapped" }
+	| { readonly kind: "restarted" }
+	| { readonly kind: "ended" }
+	| { readonly kind: "parked"; readonly cause: FailureCause }
+	| { readonly kind: "retried" }
+);
+
+/**
+ * What a hold placed here binds to (`serving`): its object, or why it waits unbound (`failed { waiting }`: not served,
+ * another version, or placed elsewhere by the provider's code).
+ */
+export type Serving =
+	| { readonly kind: "object"; readonly object: ChordObject }
+	| { readonly kind: "waiting"; readonly cause: FailureCause };
+
+/** A published plugin: its facet (an unchanged reload passes the same object), its registries and contributions. */
+type LoadedPlugin<P extends Principal> = {
+	readonly facet: Facet<P>;
+	readonly registries: readonly string[];
+	readonly contributions: readonly RegistryContribution[];
+};
+
+/** What a reload staged: the staged set, the plugins by change, and each affected object's fate. */
+type ReloadPlan<P extends Principal> = {
+	readonly staged: Staged;
+	readonly facets: ReadonlyMap<string, Facet<P>>;
+	readonly added: readonly string[];
+	readonly changed: readonly string[];
+	readonly removed: readonly string[];
+	readonly fates: readonly PlannedFate[];
+};
+
+/** An affected object's fate, as staging decided it. */
+type PlannedFate =
+	| { readonly kind: "end"; readonly object: ChordObject }
+	| { readonly kind: ReloadFate; readonly object: ChordObject; readonly served: Served };
+
+/** A fate started by a reload's commit, for its report: a swap's or retry's new attempt is checked first. */
+type StartedFate =
+	| { readonly object: string; readonly kind: "ended" }
+	| { readonly object: string; readonly kind: "swapped" | "restarted" | "retried"; readonly attempt: Attempt };
 
 /** Creates a host. */
 export function createHost<P extends Principal = Principal, R extends JsonValue = JsonValue>(
@@ -237,9 +365,6 @@ const NO_CHAIN: readonly string[] = [];
 
 /** The params of a type with empty params, as checked: nothing, and the empty key. */
 const EMPTY_PARAMS: CheckedParams = { params: {}, key: "" };
-
-/** An npm package name, scoped or not. */
-const PLUGIN_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/;
 
 /** The host: its served types, its objects by identity, its batch, backoff and endings. */
 export class ChordHost<P extends Principal = Principal, R extends JsonValue = JsonValue> implements Host<P, R> {
@@ -259,12 +384,21 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	/** The presence list of each type someone asked about (`references`), by type name. */
 	readonly #references = new Map<string, References>();
 	readonly #onError: (error: HostError) => void;
-	readonly #types = new Map<string, Served>();
+	/** The served types by name: the published plugin set's (a reload's commit replaces it). */
+	#types = new Map<string, Served>();
+	/** The published plugins by name: their facet (an unchanged one is the same object), registries and contributions. */
+	readonly #plugins = new Map<string, LoadedPlugin<P>>();
+	/** The reloads, one after another (slice 7b §1): the last one's end, which the next one waits for. */
+	#reloading: Promise<unknown> = Promise.resolve();
 	/** By identity, in the order they went live (the others where they were created). */
 	readonly #objects = new Map<string, ChordObject>();
 	/** Teardowns still running, by identity: the next instance of an identity waits for its previous ones. */
 	readonly #endings = new Map<string, Promise<void>>();
-	readonly #loaded = Promise.withResolvers<void>();
+	/** The requests that cannot bind yet, by name: before the publication all of them, then those left unbound. */
+	readonly #unbound = new UnboundIndex();
+	/** Resolved at the host's first publication (`load`'s batch), or its close. */
+	readonly #publication = Promise.withResolvers<void>();
+	#published = false;
 	/** Every open link: children, routes and the parent. */
 	readonly #links = new Set<HostLink>();
 	/** Where holds go that are not served here and not routed: the parent link, across reconnects. */
@@ -275,13 +409,16 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	 */
 	readonly unplaced = new Path(() => {});
 	readonly #routes = new Map<string, Route>();
-	readonly #placement: Placement;
+	readonly #destination: Destination;
 	/** The downstream origins this host relays holds for, by their number on upstream links (never reused). */
 	readonly relays = new Map<number, ProviderSide>();
 	#nextOrigin = 1;
-	/** Aborted when the host closes: the context of every route's `resolve`. */
+	/** Aborted when the host closes: the context of every route's `resolve`, and the end of waiting `host.registry`s. */
 	readonly #routing = new AbortController();
 	readonly #heartbeat: { readonly ping: number; readonly close: number };
+	/** Its registries by name, each made by its first use (a serve, a contribution or a reader). */
+	readonly #registries = new Map<string, RegistryRecord>();
+	readonly #roots = new RootScopes(this);
 	/** The one heartbeat timer, running while the host has a link. */
 	#ticking: ReturnType<typeof setInterval> | undefined;
 	#state: "new" | "loading" | "loaded" | "closed" = "new";
@@ -300,31 +437,179 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		this.#revocationKeys = new RevocationKeys(options.revokedBy as RevokedBy<Principal, JsonValue> | undefined);
 		this.timeouts = { close: options.closeTimeout ?? 30_000, ready: options.readyTimeout ?? 60_000 };
 		this.#heartbeat = { ping: options.heartbeat?.ping ?? 15_000, close: options.heartbeat?.close ?? 30_000 };
-		this.#placement = new Placement(this.address, this.#types, this.#routes, this.#parent);
+		this.#destination = new Destination(this.address, this.#routes, this.#parent);
 		// Chord's own: `openStore` made it.
 		this.store = options.store as ChordStore | undefined;
-		this.store?.attach((error) => this.#storageFailed(error));
+		this.store?.attach({ failed: (error) => this.#storageFailed(error), batch: this.batch });
 	}
 
-	async load(facets: readonly { readonly name: string; readonly facet: Facet<P> }[], context: Context): Promise<void> {
+	async load(facets: readonly PluginFacet<P>[], context: Context): Promise<void> {
 		this.batch.assertOutside("load");
 		this.#assertOpen();
 		if (this.#state !== "new") throw new Error("load runs once per host");
 		this.#state = "loading";
 		try {
-			this.#setUp(facets);
+			const staged = stagePlugins(facets, this.#stagingHost());
+			this.#types = staged.types;
+			// The publication: the types and registries served, the facets' contributions and the first composition of
+			// every served registry, in one batch, before any object activates.
+			this.batch.commit(() => {
+				this.#publish(staged, staged.contributions.keys(), facetsByName(facets));
+				for (const record of this.#registries.values()) record.composeServed();
+			}, context);
 		} catch (error) {
 			// The host closes as `close` would: its links too. Nothing was activated, so no close can fail.
 			this.#closing ??= this.#close();
 			await this.#closing.catch(() => {});
 			throw error;
 		}
+		// After the batch: what waited for the publication is placed (the gate lasted only for the setups).
+		this.#published = true;
+		this.#publication.resolve();
+		this.#unbound.wakeAll();
 		const objects = [...this.#types.values()]
 			.filter((served) => served.kind === "local" && served.hostLifetime)
 			.map((served) => this.#object(served, EMPTY_PARAMS, undefined, context));
-		await Promise.allSettled(objects.map(({ settled }) => settled));
+		await Promise.all(objects.map(({ firstOutcome }) => firstOutcome));
 		if (this.#state === "loading") this.#state = "loaded";
-		this.#loaded.resolve();
+	}
+
+	reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport> {
+		this.batch.assertOutside("reload");
+		if (this.#state === "closed") return Promise.reject(this.#closedError());
+		if (this.#state !== "loaded") throw new Error("reload runs after load");
+		const reload = this.#reloading.then(() => this.#reload(facets, context));
+		this.#reloading = reload.catch(() => {});
+		return reload;
+	}
+
+	/** One reload, after the previous one: staging, the commit, the fates, the report. */
+	async #reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport> {
+		this.#assertOpen();
+		if (context.abortSignal?.aborted) throw reloadAborted();
+		const plan = this.#stageReload(facets, context);
+		// Aborted while it staged (a setup may abort it synchronously): rejected as a staging error, nothing changed.
+		if (context.abortSignal?.aborted) throw reloadAborted();
+		const started = this.#commit(plan, context);
+		const objects = await this.#report(started, context);
+		const { added, changed, removed } = plan;
+		return { plugins: { added, changed, removed }, objects };
+	}
+
+	/**
+	 * Staging (slice 7b §2), synchronous (no request or arriving hold meets it half done): every setup runs into a
+	 * staged table (`stagePlugins`), every object of a changed or removed plugin whose type is still served has its new
+	 * factory recorded, which decides its fate. A throw rejects the reload with nothing changed.
+	 */
+	#stageReload(facets: readonly PluginFacet<P>[], context: Context): ReloadPlan<P> {
+		const staged = stagePlugins(facets, this.#stagingHost());
+		const byName = facetsByName(facets);
+		const added: string[] = [];
+		const changed: string[] = [];
+		const removed = [...this.#plugins.keys()].filter((name) => !byName.has(name));
+		for (const [name, facet] of byName) {
+			const loaded = this.#plugins.get(name);
+			if (loaded === undefined) added.push(name);
+			else if (loaded.facet !== facet) changed.push(name);
+		}
+		const reloaded = new Set([...changed, ...removed]);
+		const fates: PlannedFate[] = [];
+		for (const object of this.#objects.values()) {
+			if (!reloaded.has(object.served.plugin)) continue;
+			const served = staged.types.get(object.served.contract.name);
+			if (served === undefined || served.kind !== object.served.kind) {
+				fates.push({ kind: "end", object });
+				continue;
+			}
+			fates.push({ kind: object.reloadFate(recordFactory(object, served, context)), object, served });
+		}
+		return { staged, facets: byName, added, changed, removed, fates };
+	}
+
+	/**
+	 * The commit (slice 7b §3), one batch: the served types become the staged ones (an unchanged plugin's stay as
+	 * they were), the removed plugins' registry providers go and the reloaded ones' are replaced, their facet
+	 * contributions replaced by plugin, every changed registry composed once; a removed type's presence list goes.
+	 * Then each object takes its fate, host-lifetime objects of new types start, and the publication wakes the
+	 * requests waiting for the names the reload serves.
+	 */
+	#commit(plan: ReloadPlan<P>, context: Context): readonly StartedFate[] {
+		const { staged, added, changed, removed } = plan;
+		const published = new Set([...changed, ...added]);
+		const types = new Map<string, Served>();
+		// An unchanged plugin's types stay as they are: its objects are untouched.
+		for (const [name, served] of staged.types) {
+			types.set(name, published.has(served.plugin) ? served : this.#types.get(name)!);
+		}
+		this.batch.commit(() => {
+			for (const name of [...changed, ...removed]) {
+				const loaded = this.#plugins.get(name)!;
+				for (const registry of loaded.registries) {
+					if (staged.registries.get(registry)?.plugin !== name) this.registryRecord(registry).unserve();
+				}
+				for (const contribution of loaded.contributions) contribution.record.remove(contribution);
+				this.#plugins.delete(name);
+			}
+			this.#types = types;
+			this.#publish(staged, published, plan.facets);
+			for (const name of published) {
+				for (const registry of this.#plugins.get(name)!.registries) this.registryRecord(registry).composeServed();
+			}
+		}, context);
+		for (const name of this.#references.keys()) if (!types.has(name)) this.#references.delete(name);
+		const names = new Set<string>();
+		for (const [name, served] of types) if (published.has(served.plugin)) names.add(name);
+		for (const [name, { plugin }] of staged.registries) if (published.has(plugin)) names.add(name);
+		const started = plan.fates.map((fate) => this.#startFate(fate));
+		for (const type of types.values()) {
+			if (type.kind === "local" && type.hostLifetime) this.#object(type, EMPTY_PARAMS, undefined, context);
+		}
+		this.#unbound.wake(names);
+		return started;
+	}
+
+	/**
+	 * Starts one object's fate after the commit (slice 7b §4): a removed type's object ends, its holders waiting
+	 * `not_served`; any other swaps, restarts or retries on its new served type.
+	 */
+	#startFate(fate: PlannedFate): StartedFate {
+		const { object } = fate;
+		if (fate.kind === "end") {
+			const error = new ChordError({
+				code: "unavailable",
+				message: `${object.served.contract.name} is not served here`,
+			});
+			object.remove({ kind: "waiting", error });
+			return { object: object.label, kind: "ended" };
+		}
+		const attempt = object.reload(fate.served, fate.kind);
+		return { object: object.label, kind: STARTED[fate.kind], attempt };
+	}
+
+	/**
+	 * The report, once every swap and retry had its first dependency check (a parked one reports why); restarts are
+	 * reported at once (their check follows the drain). `context`'s abort ends only this wait (`aborted`).
+	 */
+	async #report(started: readonly StartedFate[], context: Context): Promise<ReloadedObject[]> {
+		const checks = started.map(async (fate): Promise<ReloadedObject> => {
+			if (fate.kind === "ended" || fate.kind === "restarted") return { object: fate.object, kind: fate.kind };
+			const cause = await fate.attempt.checked;
+			return cause === undefined
+				? { object: fate.object, kind: fate.kind }
+				: { object: fate.object, kind: "parked", cause };
+		});
+		try {
+			return await awaitWithContext(Promise.all(checks), context);
+		} catch {
+			throw reloadAborted();
+		}
+	}
+
+	/** This host as staging sees it: whom it acts as, its address and its presence lists. */
+	#stagingHost(): StagingHost {
+		// Setups get presence lists of this host's `P`; staging passes them on as they are.
+		const references = (Type: Contract) => this.references(Type);
+		return { principal: this.principal, address: this.address, references: references as StagingHost["references"] };
 	}
 
 	async get<C extends Contract>(
@@ -385,9 +670,18 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		for (const object of [...this.#objects.values()]) {
 			if (object.principal !== undefined && revoked(object.principal)) object.end(error(object.label));
 		}
-		// Holds admitted before this revoke but still waiting for `load` would take revoked objects afterwards.
-		const waiting = error("a hold waiting for load");
-		for (const link of this.#links) link.revokeWaiting(revoked, waiting);
+		// Requests not bound (waiting for the publication or a provider, refused, waiting for their link) end too: nothing
+		// revives them.
+		const unbound = error("an unbound request");
+		this.#unbound.revoke(revoked, unbound);
+		for (const link of this.#links) link.revokeUnbound(revoked, unbound);
+		// This host's own requests over its paths, linked or not (a route still resolving, a link down): a later link
+		// would hold them again (fix round 1).
+		for (const holder of this.#pathHolders()) {
+			if (holder.kind !== "remote") continue;
+			const { principal } = holder.caller;
+			if (principal !== undefined && revoked(principal)) holder.revoke(error(holder.label));
+		}
 		// Down the route links before the child links close: a worker ends the principal's objects with the revocation's
 		// error before the closed origins release their holds.
 		for (const link of this.#links) if (link.role === "route") link.send({ kind: "revoke", revocation });
@@ -413,6 +707,54 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		return references as unknown as Watchable<readonly Presence<C, P>[]>;
 	}
 
+	async registry<C, V>(R: Registry<C, V>, context: Context, options: GetOptions = {}): Promise<RegistryValue<V>> {
+		this.batch.assertOutside("registry");
+		this.#assertOpen();
+		const timeout = options.readyTimeout ?? this.timeouts.ready;
+		const expired = new AbortController();
+		const waiting = withLinkedAbortSignal(expired.signal, context);
+		let last: unknown;
+		const deadline = setTimeout(() => expired.abort(last ?? notLive(`registry ${R.name}`, timeout)), timeout);
+		// The host's close ends the wait at once, `released/closed` (its timer with it).
+		const closing = (): void => expired.abort(this.#closedError());
+		this.#routing.signal.addEventListener("abort", closing, { once: true });
+		try {
+			await awaitWithContext(this.#publication.promise, waiting.context);
+			this.#assertOpen();
+			const value = this.registryRecord(R.name).value(R.version);
+			// Its values are the composition as `R`'s version has it, `V`.
+			const usable = (): boolean => {
+				const start = value.start();
+				if (start.kind === "value" || start.last !== undefined) return true;
+				last = start.error;
+				return false;
+			};
+			if (!usable()) await untilUsable(value, usable, waiting.context);
+			return value as RegistryValue<V>;
+		} finally {
+			clearTimeout(deadline);
+			this.#routing.signal.removeEventListener("abort", closing);
+			waiting.release();
+		}
+	}
+
+	async root<T>(fn: (ctx: Ctx<P>) => Promise<T>, context: Context, options: RootOptions<P> = {}): Promise<T> {
+		this.batch.assertOutside("root");
+		this.#assertOpen();
+		// The scope's ctx acts as `principal`, a `P`.
+		return this.#roots.run(fn as (ctx: Ctx) => Promise<T>, options.principal ?? this.principal, context);
+	}
+
+	/** The record of registry `name` on this host, made by its first use. */
+	registryRecord(name: string): RegistryRecord {
+		let record = this.#registries.get(name);
+		if (record === undefined) {
+			record = new RegistryRecord(name, this.batch, (error) => this.report(error));
+			this.#registries.set(name, record);
+		}
+		return record;
+	}
+
 	async close(_context: Context): Promise<void> {
 		this.batch.assertOutside("close");
 		this.#closing ??= this.#close();
@@ -420,11 +762,29 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	}
 
 	/**
-	 * What a hold arriving before `load` resolved waits for; `undefined` once it resolved (or the host closed), so a
-	 * later hold takes its reference at once, in the turn it arrived (R18's handover: a new hold before the old's release).
+	 * Whether the host published its setups (`load`'s batch): until then requests made here and holds arriving wait in
+	 * the unbound index, placed by the publication.
 	 */
-	get pendingLoad(): Promise<void> | undefined {
-		return this.#state === "new" || this.#state === "loading" ? this.#loaded.promise : undefined;
+	get published(): boolean {
+		return this.#published;
+	}
+
+	/** `request` cannot bind yet: indexed under `name` (the type or registry it waits for) until woken or ended. */
+	index(name: string, request: UnboundRequest): void {
+		this.#unbound.add(name, request);
+	}
+
+	/**
+	 * `binding`, whose object left it (its type removed, its version no longer bound: slice 7b §6), waits unbound with
+	 * `cause` under its type's name; a publication places it again (`params` checked as it was, under `context`).
+	 */
+	rewait(binding: Binding, Type: Contract, params: CheckedParams, cause: FailureCause, context: Context): void {
+		this.#wait(binding, Type.name, cause, () => this.#place(binding, Type, params, context));
+	}
+
+	/** `request` left the unbound index's wait for `name` (it ended, or a retry checks it again). */
+	unindex(name: string, request: UnboundRequest): void {
+		this.#unbound.delete(name, request);
 	}
 
 	/** Whether the host closes: its objects end through `close`, not through its links. */
@@ -434,8 +794,9 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 
 	/**
 	 * A reference to `Type` made by `caller` (its principal, its origin's incarnation), once it is live (`host.get`,
-	 * `ctx.get`): a hold, waited for up to the getter's one deadline, across reconnects; a broken failure rejects at
-	 * once, the deadline with the last failure's error. A getter that gives up releases its reference.
+	 * `ctx.get`): a hold, waited for up to the getter's one deadline, across reconnects and through `loading`,
+	 * `failed { transient }` and `failed { waiting }`; a broken failure rejects at once, the deadline with the last
+	 * failure's error. A getter that gives up releases its reference.
 	 */
 	async acquire(
 		Type: Contract,
@@ -488,74 +849,82 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 
 	/**
 	 * An unbound reference to an object of `Type` made by `caller`, declared by `dependent` (`undefined` for
-	 * `host.get`, `host.hold` and `ctx.get`). Throws where it cannot go (`#assertRoute`).
+	 * `host.get`, `host.hold` and `ctx.get`).
 	 */
 	reference(Type: Contract, dependent: ChordObject | undefined, caller: Caller, options: GetOptions): Binding {
 		this.#assertOpen();
-		this.#assertRoute(Type);
 		return this.#binding(Type, dependent, caller, options);
 	}
 
 	/**
-	 * Binds `binding` to the object for (Type, params) as its principal where its placement puts it (`Placement`): the
-	 * object here, created with its first attempt if there is none, or a remote object held over its path. Throws as
-	 * `Placement.reference` does.
+	 * Binds `binding` to the object for (Type, params) as its principal where its host address puts it (`Destination`):
+	 * the object here, created with its first attempt if there is none, or a remote object held over its path. Placed
+	 * here, the check is only against the type served here: not served (or of the other kind) or not at the caller's
+	 * version and fingerprint, the reference waits unbound, `failed { waiting }`, indexed under the type's name. Returns
+	 * the object it bound to; throws as `Destination.reference` does (a broken refusal).
 	 */
-	bind(binding: Binding, Type: Contract, params: CheckedParams, context: Context): Target {
+	bind(binding: Binding, Type: Contract, params: CheckedParams, context: Context): Target | undefined {
 		const { principal } = binding.caller;
-		const placed = this.#placement.reference(Type, params.params, principal, context);
-		let target: Target;
+		const placed = this.#destination.reference(Type, params.params, principal, context);
 		if (placed.kind === "path") {
 			const { caller, dependent } = binding;
 			const remote = new RemoteObject(this, Type, params, placed.address, caller, placed.path, dependent);
 			placed.path.attach(remote);
-			target = remote;
-		} else {
-			// Placed here: its type is served here.
-			const served = this.#types.get(Type.name)!;
-			target = this.#object(served, params, principal, context, NO_CHAIN, binding.dependent);
+			binding.bind(remote);
+			return remote;
 		}
-		binding.bind(target);
-		return target;
+		const served = this.#types.get(Type.name);
+		const unbound =
+			unboundCause(served, Type.kind, Type.name, Type.version, Type.fingerprint) ??
+			this.#misplaced(Type, served!, params.params);
+		if (unbound !== undefined) {
+			this.#wait(binding, Type.name, unbound, () => this.#place(binding, Type, params, context));
+			return undefined;
+		}
+		// Checked above: served here at the caller's version.
+		const object = this.#object(served!, params, principal, context, NO_CHAIN, binding.dependent);
+		binding.bind(object);
+		return object;
 	}
 
-	/** Where a hold arriving on `link` goes (`Placement.hold`); `released` once the host closed. */
+	/** Where a hold arriving on `link` goes (`Destination.hold`: by the address it names); `released` once the host closed. */
 	place(request: HoldRequest, link: HostLink, caller: Caller, context: Context): Placed {
 		this.#assertOpen();
-		return this.#placement.hold(request, link, caller.principal, context);
+		return this.#destination.hold(request, link, caller.principal, context);
 	}
 
 	/**
-	 * The object a hold placed here binds to, acting as `principal`: a remote type served here (otherwise
-	 * `unavailable`) with the hold's version and fingerprint (`contract_mismatch`), valid params, and placed here, its
-	 * placement computed from the params (`invalid/placement`); not an activation the hold's chain waits for
-	 * (`invalid/cycle`, Q5). A new object keeps the hold's chain.
+	 * What a hold placed here binds to, acting as `principal`: the object, or why it waits unbound (`failed
+	 * { waiting }`): a remote type not served here (`not_served`), not at the hold's version and fingerprint, or whose
+	 * params put it on another host (code skew: `version`). Throws for a broken refusal: invalid params, an activation
+	 * the hold's chain waits for (`invalid/cycle`, Q5). A new object keeps the hold's chain.
 	 */
-	serving(request: HoldRequest, params: unknown, principal: Principal, context: Context): ChordObject {
+	serving(request: HoldRequest, params: unknown, principal: Principal, context: Context): Serving {
 		const { type, version, fingerprint, chain = NO_CHAIN } = request;
 		const served = this.#types.get(type);
-		if (served?.kind !== "remote") {
-			throw new ChordError({ code: "unavailable", message: `${type} is not served here` });
-		}
-		this.#assertMatch(served, version, fingerprint);
-		const checked = checkParams(served.contract, params, context);
-		this.#placement.assertHere(served.contract, checked.params);
-		const object = this.#object(served, checked, principal, context, chain);
+		const unbound = unboundCause(served, "remote", type, version, fingerprint);
+		if (unbound !== undefined) return { kind: "waiting", cause: unbound };
+		// Checked above: a remote type served here.
+		const remote = served as Extract<Served, { readonly kind: "remote" }>;
+		const checked = checkParams(remote.contract, params, context);
+		const misplaced = this.#destination.misplaced(remote.contract, checked.params);
+		if (misplaced !== undefined) return { kind: "waiting", cause: { kind: "waiting", error: misplaced } };
+		const object = this.#object(remote, checked, principal, context, chain);
 		const activation = object.activationId;
 		if (activation !== undefined && chain.includes(activation)) throw this.cycle(chain, activation, [object.label]);
-		return object;
+		return { kind: "object", object };
 	}
 
 	/**
 	 * The path a remote reference of `Type` with `params` acting as `principal` goes over now: `ref.retry()` places a
 	 * reference failed for a part past the limits anew (a route may have forgotten its old path). Throws as
-	 * `Placement.reference` does, and `unavailable` for a type served here now.
+	 * `Destination.reference` does, and `unavailable` for a type placed here now.
 	 */
 	pathOf(Type: Contract, params: ParamsOf<Contract>, principal: Principal | undefined): Path {
 		// A retry has no context of its own: its admission checks count on none.
-		const placed = this.#placement.reference(Type, params, principal, BACKGROUND_CONTEXT);
+		const placed = this.#destination.reference(Type, params, principal, BACKGROUND_CONTEXT);
 		if (placed.kind === "path") return placed.path;
-		throw new ChordError({ code: "unavailable", message: `${Type.name} is served here now` });
+		throw new ChordError({ code: "unavailable", message: `${Type.name} is placed here now` });
 	}
 
 	/**
@@ -633,41 +1002,54 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	}
 
 	/**
-	 * A reference to `Type` made by `caller` for `host.hold` and getters: params and where it goes checked at once
-	 * (`invalid/params`, `#assertRoute`), then bound (a placement or route that fails fails the reference broken);
-	 * before `load` resolved, both once it did (a host closed meanwhile releases it).
+	 * A reference to `Type` made by `caller` for `host.hold` and getters: params checked at once (`invalid/params`,
+	 * also before `load`), then placed (`#place`); before the host's publication it waits in the unbound index,
+	 * `loading`, and the publication places it.
 	 */
 	#hold(Type: Contract, params: unknown, caller: Caller, context: Context, options: GetOptions): Binding {
 		this.#assertOpen();
 		const checked = checkParams(Type, params, context);
-		if (this.pendingLoad === undefined) {
-			const binding = this.reference(Type, undefined, caller, options);
-			this.#bindOrFail(binding, Type, checked, context);
-			return binding;
-		}
 		const binding = this.#binding(Type, undefined, caller, options);
-		// Raced with the reference's end: a release before `load` resolved lets go of the binding, its contract and
-		// `context` at once (only the race's settled promise stays behind in `load`'s reactions).
-		void Promise.race([this.#loaded.promise, binding.ended()]).then(() => {
-			// Released while `load` ran: nothing is made for it.
-			if (binding.refState.kind === "ended") return;
-			if (this.#state === "closed") return binding.end(this.#closedError());
-			this.#bindOrFail(binding, Type, checked, context);
-		});
+		const place = (): void => this.#place(binding, Type, checked, context);
+		if (this.#published) place();
+		else this.#wait(binding, Type.name, undefined, place);
 		return binding;
 	}
 
 	/**
-	 * Binds a reference (`bind`); where it cannot go (`#assertRoute`, a placement or `authorize` that throws or refuses)
-	 * fails it broken.
+	 * Places a reference (`bind`); where it cannot go (a `hostAddress` or `authorize` that throws or refuses) fails it
+	 * broken, until `ref.retry()` places it again. One woken after the host closed ends as the close ended the others.
 	 */
-	#bindOrFail(binding: Binding, Type: Contract, checked: CheckedParams, context: Context): void {
+	#place(binding: Binding, Type: Contract, checked: CheckedParams, context: Context): void {
+		if (this.#state === "closed") {
+			binding.end(this.#closedError());
+			return;
+		}
 		try {
-			this.#assertRoute(Type);
 			this.bind(binding, Type, checked, context);
 		} catch (error) {
-			binding.refuse({ kind: "broken", error: asChordError(error, Type.name) });
+			const again = (): void => this.#place(binding, Type, checked, context);
+			binding.refuse({ kind: "broken", error: asChordError(error, Type.name) }, again);
 		}
+	}
+
+	/**
+	 * The provider's own host-address check of a remote `Type` placed here by the consumer's contract, against the one
+	 * served (`invalid/host_address`, `waiting`: code skew); none when both have the same `hostAddress` (the consumer
+	 * computed it with the provider's function) or the type is local. A provider's `hostAddress` that throws throws.
+	 */
+	#misplaced(Type: Contract, served: Served, params: ParamsOf<Contract>): FailureCause | undefined {
+		if (served.kind !== "remote" || contractData(Type).hostAddress === contractData(served.contract).hostAddress) {
+			return undefined;
+		}
+		const error = this.#destination.misplaced(served.contract, params);
+		return error === undefined ? undefined : { kind: "waiting", error };
+	}
+
+	/** Leaves `binding` unbound in the index under `name`: `cause` (`waiting`), or none before the publication. */
+	#wait(binding: Binding, name: string, cause: FailureCause | undefined, place: () => void): void {
+		binding.wait(cause, place, () => this.#unbound.delete(name, binding));
+		this.#unbound.add(name, binding);
 	}
 
 	/** A new reference's binding made by `caller`; its parked calls wait its `readyTimeout`. */
@@ -705,22 +1087,6 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 			}, Math.min(ping, close) / 10);
 		}
 		return made;
-	}
-
-	/**
-	 * Throws where a reference to `Type` cannot go: a type served here needs the caller's version and fingerprint
-	 * (`contract_mismatch`); a local type never crosses a link (`unavailable`). A remote type not served here goes on (a
-	 * route or the parent link), open yet or not.
-	 */
-	#assertRoute(Type: Contract): void {
-		const served = this.#types.get(Type.name);
-		if (served === undefined) {
-			if (Type.kind === "local") {
-				throw new ChordError({ code: "unavailable", message: `${Type.name} is not served here` });
-			}
-			return;
-		}
-		this.#assertMatch(served, Type.version, Type.fingerprint);
 	}
 
 	/**
@@ -768,12 +1134,14 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		for (const role of ["child", "route", "parent"]) for (const link of links) if (link.role === role) link.close();
 		// Remote references end now: their parked calls reject `released`, no later link holds them.
 		const closed = this.#closedError();
-		const holders = [
-			...this.#parent.holders(),
-			...this.unplaced.holders(),
-			...[...this.#routes.values()].flatMap((route) => route.close()),
-		];
-		for (const holder of holders) if (holder.kind === "remote") holder.lost(closed);
+		// Code outside objects stops at its next use of Chord: an `fn` waiting in `sleep(ms, ctx)` ends.
+		this.#roots.close(closed);
+		for (const route of this.#routes.values()) route.close();
+		for (const holder of this.#pathHolders()) if (holder.kind === "remote") holder.lost(closed);
+		// At the fence too: requests still waiting for a publication or a provider end as the others did, and gets
+		// waiting for a publication that will not come fail now, not after the slow closes below (fix round 1).
+		this.#unbound.close(closed);
+		this.#publication.resolve();
 		this.backoff.clear();
 		// Every object is sealed before any teardown releases a reference, so none ends in the background.
 		const teardowns = [...this.#objects.values()].reverse().map((object) => object.stop());
@@ -781,9 +1149,11 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		const failures: CloseFailed[] = [];
 		for (const tearDown of teardowns) failures.push(...(await tearDown()));
 		this.#types.clear();
+		// Their facets keep their factories' closures (which may keep objects' handles).
+		this.#plugins.clear();
+		for (const record of this.#registries.values()) record.close();
+		this.#registries.clear();
 		this.store?.detach();
-		// Gets waiting for a load that will not come fail now.
-		this.#loaded.resolve();
 		if (failures.length > 0) {
 			const message = `host.close: ${failures.length} native close(s) threw`;
 			throw new AggregateError(
@@ -791,6 +1161,12 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 				message,
 			);
 		}
+	}
+
+	/** Every holder of the parent path, the unplaced one and every route's paths: this host's requests over links. */
+	#pathHolders(): Upstream[] {
+		const routed = [...this.#routes.values()].flatMap((route) => route.holders());
+		return [...this.#parent.holders(), ...this.unplaced.holders(), ...routed];
 	}
 
 	/** The store stopped after a backend error (it tells the host once): reported, and the host closes. */
@@ -808,47 +1184,28 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		else object.attempt();
 	}
 
-	/** Runs every facet's setup, checking the plugin names (npm names, each once), and serves what they declared. */
-	#setUp(facets: readonly { readonly name: string; readonly facet: Facet<P> }[]): void {
-		const names = new Set<string>();
-		for (const { name, facet } of facets) {
-			if (!PLUGIN_NAME.test(name)) throw new Error(`"${name}" is not a valid plugin name`);
-			if (names.has(name)) throw new Error(`plugin "${name}" is loaded twice`);
-			names.add(name);
-			for (const entry of setUp(name, facet, (Type) => this.references(Type))) this.#serve(entry);
-		}
-	}
-
-	#serve({ contract, factory, options }: ServedEntry): void {
-		if (this.#types.has(contract.name)) throw new Error(`${contract.name} is served twice`);
-		// A client serves only local types (§3): a remote object is owned by a principal of the host serving it.
-		if (contract.kind === "remote" && this.principal === undefined) {
-			throw new Error(`${contract.name}: a host without a principal serves only local types`);
-		}
-		const common = { provider: bindProvider(contract, {}), linger: options.linger ?? 0 };
-		// The contract's kind decides the factory's signature and the contract's shape.
-		const served: Served =
-			contract.kind === "local"
-				? {
-						...common,
-						kind: "local",
-						contract: contract as LocalContract,
-						factory: factory as Extract<Served, { kind: "local" }>["factory"],
-						hostLifetime: contractData(contract).params.fields.length === 0,
-					}
-				: {
-						...common,
-						kind: "remote",
-						contract: contract as RemoteContract,
-						factory: factory as Extract<Served, { kind: "remote" }>["factory"],
-					};
-		this.#types.set(contract.name, served);
-	}
-
-	#assertMatch(served: Served, version: number, fingerprint: string): void {
-		if (version !== served.contract.version || fingerprint !== served.contract.fingerprint) {
-			const message = `${served.contract.name} v${version} does not match the served v${served.contract.version}`;
-			throw new ChordError({ code: "contract_mismatch", message });
+	/**
+	 * Publishes staged plugins `names` of `staged`, inside the publication's batch: their types served (`types`), the
+	 * registries they serve served (and composed once), their facet contributions entered into the tables.
+	 */
+	#publish(staged: Staged, names: Iterable<string>, facets: ReadonlyMap<string, Facet<P>>): void {
+		for (const name of names) {
+			const registries: string[] = [];
+			for (const [registry, { plugin, registry: token, provider }] of staged.registries) {
+				if (plugin !== name) continue;
+				this.registryRecord(registry).serve(token.version, provider);
+				registries.push(registry);
+			}
+			const contributions = (staged.contributions.get(name) ?? []).map(({ registry, value }) =>
+				contributionOf(
+					this.registryRecord(registry.name),
+					{ plugin: name, type: undefined },
+					registry.version,
+					value,
+				),
+			);
+			for (const contribution of contributions) contribution.record.add(contribution);
+			this.#plugins.set(name, { facet: facets.get(name)!, registries, contributions });
 		}
 	}
 
@@ -859,4 +1216,60 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	#closedError(): ChordError {
 		return new ChordError({ code: "released", reason: "closed", message: "the host is closed" });
 	}
+}
+
+/**
+ * Why a reference to a type of `kind` at `version` and `fingerprint`, placed here, cannot bind to `served` (the type of
+ * that name served here): not served, or as the other kind (`unavailable`); another version or fingerprint
+ * (`contract_mismatch`); `undefined` when it binds. Both wait for a publication: `failed { waiting }`.
+ */
+function unboundCause(
+	served: Served | undefined,
+	kind: Contract["kind"],
+	name: string,
+	version: number,
+	fingerprint: string,
+): FailureCause | undefined {
+	if (served === undefined || served.kind !== kind) {
+		return { kind: "waiting", error: new ChordError({ code: "unavailable", message: `${name} is not served here` }) };
+	}
+	const { contract } = served;
+	if (binds(served.provider, version, fingerprint)) return undefined;
+	const message = `${name} v${version} does not match the served v${contract.version}`;
+	return { kind: "waiting", error: new ChordError({ code: "contract_mismatch", message }) };
+}
+
+/**
+ * Waits until `usable()` (a registry value's check, which records its last error) holds, checked at every change the
+ * value tells its waiters of (after the batch that made it); rejects when `context` aborts or the value closes. It
+ * waits on the value only while it runs.
+ */
+async function untilUsable(value: RegistryValueSource, usable: () => boolean, context: Context): Promise<void> {
+	let changed = Promise.withResolvers<void>();
+	const release = value.wait({
+		dependencyMoved: () => queueMicrotask(() => changed.resolve()),
+		// The value closed with its host: the wait ends with the close's error.
+		closed: (error) => changed.reject(error),
+	});
+	try {
+		while (!usable()) {
+			await awaitWithContext(changed.promise, context);
+			changed = Promise.withResolvers<void>();
+		}
+	} finally {
+		release();
+	}
+}
+
+/** What the report calls a fate. */
+const STARTED = { swap: "swapped", restart: "restarted", retry: "retried" } as const;
+
+/** The `aborted` error of a reload whose context aborted: before its commit nothing changed; after it, only its wait. */
+function reloadAborted(): ChordError {
+	return new ChordError({ code: "aborted", message: "reload: aborted" });
+}
+
+/** The facets of a plugin set by plugin name. */
+function facetsByName<P extends Principal>(facets: readonly PluginFacet<P>[]): Map<string, Facet<P>> {
+	return new Map(facets.map(({ name, facet }) => [name, facet]));
 }
